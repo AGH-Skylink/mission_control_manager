@@ -5,3 +5,4 @@ loguru
 requests
 websockets
 psutil
+numpy
