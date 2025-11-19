@@ -1,16 +1,27 @@
 from __future__ import annotations
 
-import asyncio,time
-from typing import Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, validator
-from loguru import logger
-import numpy as np
+import asyncio
+import time
+from typing import Dict, Any
 
-from audio_manager.mixer import AudioMixer, FRAME_SIZE
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from loguru import logger
+from pydantic import BaseModel, validator
+
+from audio_manager.mixer import AudioMixer, FRAME_SIZE, FS, MAX_INT16
+from audio_manager.ptt_manager import PTTManager
+from audio_manager.models import PTTState
+from audio_manager.logger import SystemMonitor
+from audio_manager.config_loader import load_engine_config
+
 
 app = FastAPI(title="Mission Control Manager API", version="0.1.0")
+engine_cfg = load_engine_config()
 mixer = AudioMixer()
+mixer.config.headroom_db = float(engine_cfg.get("headroom_db", mixer.config.headroom_db))
+ptt_manager = PTTManager(channels=range(1, mixer.num_channels + 1))
+monitor = SystemMonitor(service_name="mission-control-audio")
 
 
 class MatrixIn(BaseModel):
@@ -18,165 +29,308 @@ class MatrixIn(BaseModel):
     downlink: Dict[int, Dict[int, float]] | None = None
     headroom_db: float | None = None
 
-    @validator('headroom_db')
-    def validate_headroom(cls, v):
-        if v is not None and (v < 0 or v > 60):
-            raise ValueError('Headroom must be between 0 and 60 dB')
-        return v
+    @validator("uplink", "downlink", pre=True)
+    def _keys_to_int(cls, v):
+        if v is None:
+            return v
+        return {
+            int(ch): {int(tid): float(gain) for tid, gain in row.items()}
+            for ch, row in v.items()
+        }
+
+
+class MuteRequest(BaseModel):
+    mute: bool
+
+
+class PTTRequestIn(BaseModel):
+    tablet_id: int
+    channel: int
+    priority: int = 1
+
+
+class PTTReleaseIn(BaseModel):
+    tablet_id: int
+    channel: int
+
 
 @app.get("/health")
-def health():
-    try:
-        if not hasattr(mixer, 'num_channels'):
-            return {"ok": False, "error": "Mixer not initialized"}
+async def health() -> Dict[str, Any]:
+    payload = {
+        "status": "ok",
+        "ts": time.time(),
+        "num_channels": mixer.num_channels,
+        "num_tablets": mixer.num_tablets,
+        "fs": FS,
+        "frame_size": FRAME_SIZE,
+        "config": engine_cfg,
+    }
+    monitor.log_event("health.check", event_data=payload, level="DEBUG")
+    return payload
 
-        for tid in range(1, mixer.num_tablets + 1):
-            if len(mixer._tablet_in.get(tid, [])) != FRAME_SIZE:
-                return {"ok": False, "error": f"Tablet {tid} buffer corrupted"}
-
-        vu_data = mixer.vu_levels_db()
-        return {
-            "ok": True,
-            "ts": time.time(),
-            "mixer_channels": mixer.num_channels,
-            "mixer_tablets": mixer.num_tablets,
-            "vu_working": True
-        }
-
-    except Exception as e:
-        logger.error(f"Health endpoint error: {e}")
-        return {"ok": False, "error": str(e), "ts": time.time()}
 
 @app.get("/state")
-def state():
-    try:
-        return {
-            "vu_db": mixer.vu_levels_db(),
-            "routing": {
-                "uplink": mixer.config.uplink.copy(),
-                "downlink": mixer.config.downlink.copy(),
-            },
-            "mute": {
-                "tablets": mixer.config.tablet_mute.copy(),
-                "channels": mixer.config.channel_mute.copy(),
-            },
-            "headroom_db": mixer.config.headroom_db,
-            "frame_size": FRAME_SIZE,
-            "ts": time.time()
-        }
-    except Exception as e:
-        logger.error(f"State endpoint error: {e}")
-        return {"ok": False, "error": "Could not retrieve system state", "ts": time.time()}
+async def state() -> Dict[str, Any]:
+    vu_db = mixer.vu_levels_db()
+    config = {
+        "headroom_db": mixer.config.headroom_db,
+        "tablet_mute": mixer.config.tablet_mute,
+        "channel_mute": mixer.config.channel_mute,
+        "uplink": mixer.config.uplink,
+        "downlink": mixer.config.downlink,
+    }
+    ptt = ptt_manager.snapshot()
+
+    return {
+        "ts": time.time(),
+        "vu_db": vu_db,
+        "config": config,
+        "ptt": ptt,
+    }
+
 
 @app.post("/matrix")
-def set_matrix(matrix: MatrixIn):
-    try:
-        if matrix.uplink is not None:
-            mixer.set_uplink_matrix(matrix.uplink)
-            logger.info(f"Uplink matrix updated: {len(matrix.uplink)} channels")
-        if matrix.downlink is not None:
-            mixer.set_downlink_matrix(matrix.downlink)
-            logger.info(f"Downlink matrix updated: {len(matrix.downlink)} tablets")
-        if matrix.headroom_db is not None:
-            mixer.config.headroom_db = float(matrix.headroom_db)
-            logger.info(f"Headroom db updated to: {matrix.headroom_db} db")
+async def update_matrix(matrix: MatrixIn) -> Dict[str, Any]:
+    changed = {
+        "uplink_changed": matrix.uplink is not None,
+        "downlink_changed": matrix.downlink is not None,
+        "headroom_changed": matrix.headroom_db is not None,
+    }
 
-        return {"ok": True, "ts": time.time()}
+    if matrix.uplink is not None:
+        mixer.set_uplink_matrix(matrix.uplink)
+    if matrix.downlink is not None:
+        mixer.set_downlink_matrix(matrix.downlink)
+    if matrix.headroom_db is not None:
+        mixer.config.headroom_db = float(matrix.headroom_db)
 
-    except Exception as e:
-        logger.error(f"Matrix endpoint error: {e}")
-        return {"ok": False, "error": str(e), "ts": time.time()}
+    monitor.log_event(
+        "matrix.updated",
+        event_data=changed,
+        message="Mixing matrix / headroom updated",
+    )
 
-@app.post("/channel/{ch}/mute")
-def mute_channel(ch: int, mute: bool = True):
-    try:
-        if ch < 1 or ch > mixer.num_channels:
-            return {"ok": False, "error": f"Channel {ch} out of range (1-{mixer.num_channels})", "ts": time.time()}
+    return await state()
 
-        mixer.set_channel_mute(ch, mute)
-        logger.info(f"Channel {ch} mute set to {mute}")
-        return {"ok": True, "channel": ch, "mute": mute, "ts": time.time()}
 
-    except Exception as e:
-        logger.error(f"Channel mute endpoint error: {e}")
-        return {"ok": False, "error": str(e), "ts": time.time()}
+@app.post("/channel/{channel}/mute")
+async def mute_channel(channel: int, req: MuteRequest) -> Dict[str, Any]:
+    mixer.set_channel_mute(channel, req.mute)
+    monitor.log_event(
+        "channel.mute",
+        event_data={"channel": channel, "mute": req.mute},
+        message="Channel mute updated",
+    )
+    return await state()
 
-@app.post("/tablet/{tid}/mute")
-def mute_tablet(tid: int, mute: bool = True):
-    try:
-        if tid < 1 or tid > mixer.num_tablets:
-            return {"ok": False, "error": f"Tablet {tid} out of range (1-{mixer.num_tablets})", "ts": time.time()}
 
-        mixer.set_tablet_mute(tid, mute)
-        logger.info(f"Tablet {tid} mute set to {mute}")
-        return {"ok": True, "tablet": tid, "mute": mute, "ts": time.time()}
+@app.post("/tablet/{tablet_id}/mute")
+async def mute_tablet(tablet_id: int, req: MuteRequest) -> Dict[str, Any]:
+    mixer.set_tablet_mute(tablet_id, req.mute)
+    monitor.log_event(
+        "tablet.mute",
+        event_data={"tablet_id": tablet_id, "mute": req.mute},
+        message="Tablet mute updated",
+    )
+    return await state()
 
-    except Exception as e:
-        logger.error(f"Tablet mute endpoint error: {e}")
-        return {"ok": False, "error": str(e), "ts": time.time()}
+
+@app.post("/ptt/request")
+async def ptt_request(req: PTTRequestIn) -> Dict[str, Any]:
+    new_state: PTTState = ptt_manager.request_ptt(
+        tablet_id=req.tablet_id, channel=req.channel, priority=req.priority
+    )
+    channel_state = ptt_manager.get_channel_state(req.channel)
+    tablet_channels = ptt_manager.get_tablet_channels(req.tablet_id)
+
+    monitor.log_event(
+        "ptt.request",
+        event_data={
+            "tablet_id": req.tablet_id,
+            "channel": req.channel,
+            "priority": req.priority,
+            "ptt_state": new_state.value,
+            "channel_active_tablets": channel_state["active_tablets"],
+        },
+        message="PTT request handled",
+    )
+
+    return {
+        "tablet_id": req.tablet_id,
+        "channel": req.channel,
+        "ptt_state": new_state.value,
+        "channel_state": channel_state,
+        "tablet_channels": tablet_channels,
+    }
+
+
+@app.post("/ptt/release")
+async def ptt_release(req: PTTReleaseIn) -> Dict[str, Any]:
+    new_state: PTTState = ptt_manager.release_ptt(
+        tablet_id=req.tablet_id, channel=req.channel
+    )
+    channel_state = ptt_manager.get_channel_state(req.channel)
+    tablet_channels = ptt_manager.get_tablet_channels(req.tablet_id)
+
+    monitor.log_event(
+        "ptt.release",
+        event_data={
+            "tablet_id": req.tablet_id,
+            "channel": req.channel,
+            "ptt_state": new_state.value,
+            "channel_active_tablets": channel_state["active_tablets"],
+        },
+        message="PTT release handled",
+    )
+
+    return {
+        "tablet_id": req.tablet_id,
+        "channel": req.channel,
+        "ptt_state": new_state.value,
+        "channel_state": channel_state,
+        "tablet_channels": tablet_channels,
+    }
+
+
+@app.get("/ptt/state")
+async def ptt_state() -> Dict[str, Any]:
+    """Globalny snapshot PTT dla wszystkich kanałów."""
+    return ptt_manager.snapshot()
+
+
+@app.post("/config/reload")
+async def reload_config() -> Dict[str, Any]:
+    global engine_cfg
+    engine_cfg = load_engine_config()
+    mixer.config.headroom_db = float(
+        engine_cfg.get("headroom_db", mixer.config.headroom_db)
+    )
+    monitor.log_event(
+        "config.reload",
+        event_data=engine_cfg,
+        message="Engine config reloaded",
+    )
+    return {"config": engine_cfg, "state": await state()}
+
 
 @app.websocket("/ws/vu")
-async def ws_vu(ws: WebSocket):
+async def websocket_vu(ws: WebSocket) -> None:
     await ws.accept()
-    logger.info("VU WebSocket connected")
+    monitor.log_event(
+        "ws.vu.connected",
+        event_data={},
+        message="VU websocket client connected",
+    )
+
     try:
         while True:
-            try:
-                vu_data = mixer.vu_levels_db()
-                await ws.send_json(vu_data)
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logger.error(f"VU WebSocket send error: {e}")
-                break
+            payload = {
+                "ts": time.time(),
+                "vu_db": mixer.vu_levels_db(),
+            }
+            await ws.send_json(payload)
+            await asyncio.sleep(0.1)
     except WebSocketDisconnect:
-        logger.info("VU WebSocket disconnected")
-        return
-
-
-async def _engine_loop():
-    t = 0.0
-    logger.info("Audio engine simulation started")
-    try:
-        while True:
-            try:
-                for tid in range(1, 17):
-                    freq = 300 + (tid % 5) * 110
-                    phase = (t + tid) * freq * 2 * 3.14159265 / 44100.0
-                    frame = (0.1 * np.sin(phase + np.arange(FRAME_SIZE) * (2 * np.pi * freq / 44100.0))).astype(
-                        np.float32)
-                    mixer.push_tablet_frame(tid, (frame * 32767.0).astype(np.int16))
-
-                for ch in range(1, 5):
-                    mixer.push_channel_frame(ch, np.zeros(FRAME_SIZE, dtype=np.int16))
-
-                mixer.step()
-                t += FRAME_SIZE
-
-                if int(t) % (5 * 44100) < FRAME_SIZE:
-                    logger.debug(f"Audio engine running, processed {t / 44100:.1f}s of audio")
-
-                await asyncio.sleep(FRAME_SIZE / 44100.0)
-
-            except Exception as e:
-                logger.error(f"Audio engine processing error: {e}")
-                await asyncio.sleep(1.0)
-
-    except asyncio.CancelledError:
-        logger.info("Audio engine simulation stopped (Cancelled)")
-        raise
-
+        monitor.log_event(
+            "ws.vu.disconnected",
+            event_data={},
+            message="VU websocket client disconnected",
+        )
     except Exception as e:
-        logger.error(f"Audio engine fatal error: {e}")
-        logger.info("Audio engine simulation stopped due to fatal error")
+        monitor.log_error_event(
+            "ws.vu.error",
+            exc=e,
+            event_data={},
+            message="Error in VU websocket",
+        )
+        logger.exception("Error in VU websocket")
     finally:
-        logger.info("Audio engine simulation fully stopped")
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        monitor.log_event(
+            "ws.vu.closed",
+            event_data={},
+            message="VU websocket closed",
+        )
+
+
+async def _engine_loop() -> None:
+    monitor.log_event(
+        "engine.start",
+        event_data={},
+        message="Audio engine simulation loop starting",
+    )
+
+    freqs = {tid: 300.0 + 10.0 * tid for tid in range(1, mixer.num_tablets + 1)}
+    t = 0.0
+    frame_dt = FRAME_SIZE / FS
+
+    try:
+        zeros = np.zeros(FRAME_SIZE, dtype=np.int16)
+
+        while True:
+            loop_start = time.perf_counter()
+
+            for tid in range(1, mixer.num_tablets + 1):
+                f = freqs[tid]
+                t_vec = t + np.arange(FRAME_SIZE) / FS
+                samples = 0.05 * np.sin(2.0 * np.pi * f * t_vec)  # ok. -26 dBFS
+                pcm = (samples * MAX_INT16).astype(np.int16)
+                mixer.push_tablet_frame(tid, pcm)
+
+            for ch in range(1, mixer.num_channels + 1):
+                mixer.push_channel_frame(ch, zeros)
+
+            mixer.step()
+
+            t += frame_dt
+
+            elapsed = time.perf_counter() - loop_start
+            sleep_time = max(0.0, frame_dt - elapsed)
+            await asyncio.sleep(sleep_time)
+    except asyncio.CancelledError:
+        monitor.log_event(
+            "engine.cancelled",
+            event_data={},
+            message="Audio engine simulation cancelled",
+        )
+    except Exception as e:
+        monitor.log_error_event(
+            "engine.fatal_error",
+            exc=e,
+            event_data={},
+            message="Audio engine fatal error",
+        )
+        logger.exception("Audio engine fatal error")
+    finally:
+        monitor.log_event(
+            "engine.stopped",
+            event_data={},
+            message="Audio engine simulation fully stopped",
+        )
 
 
 @app.on_event("startup")
-async def startup():
+async def startup() -> None:
     try:
         asyncio.create_task(_engine_loop())
-        logger.info("Mission Control Manager API started successfully")
+        monitor.log_event(
+            "api.startup",
+            event_data={
+                "num_channels": mixer.num_channels,
+                "num_tablets": mixer.num_tablets,
+                "fs": FS,
+                "frame_size": FRAME_SIZE,
+            },
+            message="Mission Control Manager API started successfully",
+        )
     except Exception as e:
-        logger.error(f"Startup error: {e}")
-
+        monitor.log_error_event(
+            "api.startup_error",
+            exc=e,
+            event_data={},
+            message="Startup error",
+        )
+        logger.exception("Startup error")
