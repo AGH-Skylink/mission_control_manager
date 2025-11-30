@@ -6,6 +6,7 @@ from typing import Dict, Any
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel, validator
 
@@ -23,6 +24,15 @@ mixer.config.headroom_db = float(engine_cfg.get("headroom_db", mixer.config.head
 ptt_manager = PTTManager(channels=range(1, mixer.num_channels + 1))
 monitor = SystemMonitor(service_name="mission-control-audio")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173",
+                   "http://127.0.0.1:5173"
+                   ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class MatrixIn(BaseModel):
     uplink: Dict[int, Dict[int, float]] | None = None
